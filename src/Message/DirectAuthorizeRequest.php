@@ -8,6 +8,9 @@ namespace Omnipay\SagePay\Message;
 
 class DirectAuthorizeRequest extends AbstractRequest
 {
+    protected $action = 'DEFERRED';
+    protected $service = 'vspdirect-register';
+
     /**
      * @var array Some mapping from Omnipay card brand codes to Sage Pay card branc codes.
      */
@@ -15,23 +18,6 @@ class DirectAuthorizeRequest extends AbstractRequest
         'mastercard' => 'MC',
         'diners_club' => 'DC'
     );
-
-    /**
-     * @return string the transaction type
-     */
-    public function getTxType()
-    {
-        if ($this->getUseAuthenticate()) {
-            return static::TXTYPE_AUTHENTICATE;
-        } else {
-            return static::TXTYPE_DEFERRED;
-        }
-    }
-
-    public function getService()
-    {
-        return static::SERVICE_DIRECT_REGISTER;
-    }
 
     /**
      * The required fields concerning what is being authorised and who
@@ -42,19 +28,33 @@ class DirectAuthorizeRequest extends AbstractRequest
     protected function getBaseAuthorizeData()
     {
         $this->validate('amount', 'card', 'transactionId');
+        $card = $this->getCard();
 
         // Start with the authorisation and API version details.
         $data = $this->getBaseData();
 
         $data['Description'] = $this->getDescription();
-
-        // Money formatted as major unit decimal.
         $data['Amount'] = $this->getAmount();
         $data['Currency'] = $this->getCurrency();
 
         $data['VendorData'] = $this->getVendorData();
         $data['VendorTxCode'] = $this->getTransactionId();
-        $data['ClientIPAddress'] = $this->getClientIp();
+        // ---- "4.00" - always required fields
+        $data['ClientIPAddress'] = $this->getClientIp(); // Only IPv4 is supported; Was optional on "3.00"
+        $data['BrowserJavascriptEnabled'] = $this->getBrowserJavascriptEnabled() ?: static::BROWSER_JAVASCRIPT_NO;
+        $data['BrowserLanguage'] = $this->getBrowserLanguage() ?: static::BROWSER_LANGUAGE;
+        $data['ThreeDSNotificationURL'] = $this->getThreeDSNotificationURL();
+        $data['BrowserAcceptHeader'] = $_SERVER['HTTP_ACCEPT'];
+        $data['BrowserUserAgent'] = $_SERVER['HTTP_USER_AGENT'];
+        $data['ChallengeWindowSize'] = $this->getChallengeWindowSize() ?: static::CHALLENGE_WINDOW_SIZE_05;
+        // ----
+        // ---- "4.00" - required if BrowserJavascriptEnabled == "1"
+        $data['BrowserJavaEnabled'] = $this->getBrowserJavaEnabled();
+        $data['BrowserColorDepth'] = $this->getBrowserColorDepth();
+        $data['BrowserScreenHeight'] = $this->getBrowserScreenHeight();
+        $data['BrowserScreenWidth'] = $this->getBrowserScreenWidth();
+        $data['BrowserTZ'] = $this->getBrowserTZ();
+        // ----
 
         $data['ApplyAVSCV2'] = $this->getApplyAVSCV2() ?: static::APPLY_AVSCV2_DEFAULT;
         $data['Apply3DSecure'] = $this->getApply3DSecure() ?: static::APPLY_3DSECURE_APPLY;
@@ -63,29 +63,36 @@ class DirectAuthorizeRequest extends AbstractRequest
             $data['ReferrerID'] = $this->getReferrerId();
         }
 
-        // Billing details
+        // billing details
+        $data['BillingFirstnames'] = $card->getBillingFirstName();
+        $data['BillingSurname'] = $card->getBillingLastName();
+        $data['BillingAddress1'] = $card->getBillingAddress1();
+        $data['BillingAddress2'] = $card->getBillingAddress2();
+        $data['BillingCity'] = $card->getBillingCity();
+        $data['BillingPostCode'] = $card->getBillingPostcode();
+        $data['BillingState'] = ($card->getBillingCountry() === 'US' ? $card->getBillingState() : '');
+        $data['BillingCountry'] = $card->getBillingCountry();
+        $data['BillingPhone'] = $card->getBillingPhone();
 
-        $data = $this->getBillingAddressData($data);
+        // shipping details
+        $data['DeliveryFirstnames'] = $card->getShippingFirstName();
+        $data['DeliverySurname'] = $card->getShippingLastName();
+        $data['DeliveryAddress1'] = $card->getShippingAddress1();
+        $data['DeliveryAddress2'] = $card->getShippingAddress2();
+        $data['DeliveryCity'] = $card->getShippingCity();
+        $data['DeliveryPostCode'] = $card->getShippingPostcode();
+        $data['DeliveryState'] = ($card->getShippingCountry() === 'US' ? $card->getShippingState() : '');
+        $data['DeliveryCountry'] = $card->getShippingCountry();
+        $data['DeliveryPhone'] = $card->getShippingPhone();
+        $data['CustomerEMail'] = $card->getEmail();
 
-        // Shipping details
-
-        $data = $this->getDeliveryAddressData($data);
-
-        $card = $this->getCard();
-
-        if ($card->getEmail()) {
-            $data['CustomerEMail'] = $card->getEmail();
-        }
-
-        if ((bool)$this->getUseOldBasketFormat()) {
+        if ($this->getUseOldBasketFormat()) {
             $basket = $this->getItemDataNonXML();
-
             if (!empty($basket)) {
                 $data['Basket'] = $basket;
             }
         } else {
             $basketXML = $this->getItemData();
-
             if (!empty($basketXML)) {
                 $data['BasketXML'] = $basketXML;
             }
@@ -94,7 +101,7 @@ class DirectAuthorizeRequest extends AbstractRequest
         $surchargeXml = $this->getSurchargeXml();
 
         if ($surchargeXml) {
-            $data['surchargeXml'] = $surchargeXml;
+            $data['surchargeXml'] = $this->getSurchargeXml();
         }
 
         return $data;
@@ -141,7 +148,6 @@ class DirectAuthorizeRequest extends AbstractRequest
     public function getTokenData($data = array())
     {
         // Are there token details to add?
-
         if ($this->getToken() || $this->getCardReference()) {
             // A card token or reference has been provided.
             $data['Token'] = $this->getToken() ?: $this->getCardReference();
@@ -153,27 +159,15 @@ class DirectAuthorizeRequest extends AbstractRequest
             $storeToken = $this->getStoreToken();
 
             if ($storeToken === null) {
-                // If we are using a cardReference, then keep it stored
+                // If we are using the token as a cardReference, then keep it stored
                 // after this transaction for future use.
-                // We consider a cardReference as long term, and a token
-                // as single-use.
 
-                if ((bool)$this->getCardReference()) {
-                    $data['StoreToken'] = static::STORE_TOKEN_YES;
-                }
-            } elseif ($storeToken !== static::STORE_TOKEN_YES
-                && $storeToken !== static::STORE_TOKEN_NO
-            ) {
-                // A store token to treat as a boolean has been supplied.
-
-                $data['StoreToken'] = (bool)$storeToken
+                $storeToken = $this->getCardReference()
                     ? static::STORE_TOKEN_YES
                     : static::STORE_TOKEN_NO;
-            } else {
-                // A valid store token to use directly has been supplied.
-
-                $data['StoreToken'] = $storeToken;
             }
+
+            $data['StoreToken'] = $storeToken;
         }
 
         return $data;
@@ -215,12 +209,7 @@ class DirectAuthorizeRequest extends AbstractRequest
 
         // If we want the card details to be saved on the gateway as a
         // token or card reference, then request for that to be done.
-
-        $createCard = $this->getCreateToken() ?: $this->getCreateCard();
-
-        if ($createCard !== null) {
-            $data['CreateToken'] = $createCard ? static::CREATE_TOKEN_YES : static::CREATE_TOKEN_NO;
-        }
+        $data['CreateToken'] = $this->getCreateToken();
 
         if ($this->getCard()->getCvv() !== null) {
             $data['CV2'] = $this->getCard()->getCvv();
